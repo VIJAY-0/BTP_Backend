@@ -1,17 +1,16 @@
 import cv2 as cv
 import numpy as np
-import os
 from matplotlib import pyplot as plt
 import matplotlib
-matplotlib.use('Agg')  # Non-GUI backend
 from math import atan2, degrees
-# from scipy.interpolate import splprep, splev
-
-import cv2 as cv
-import numpy as np
 import matplotlib.pyplot as plt
 import base64
 from io import BytesIO
+from skimage import morphology
+from PIL import Image
+
+matplotlib.use('Agg') 
+
 
 def process_image(image_file):
     img_np = np.frombuffer(image_file.read(), np.uint8)
@@ -19,6 +18,11 @@ def process_image(image_file):
     print(image.shape)
     contours = detect_contours(image)
     data = generate_contourImage_and_otherData(contours, image)
+    
+    skeleton = skeletonize(image)
+    
+    data2 = generate_branching_dist(image)
+    data['branching_dist'] = data2
     return data
 
 
@@ -113,7 +117,9 @@ def generate_contourImage_and_otherData(contours, image):
         "Extent": extents,
         "Circularity": circularities,
     }
-
+    units ={"Length":'px' , "Area":'px^2' , "Perimeter":'px' , "Aspect Ratio":'' , "Compactness":'' , "Solidity":'' , "Extent":'' , "Circularity":''}  
+    
+    
     histogram_images = {}
     for i, (param_name, values) in enumerate(parameters.items()):
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -148,16 +154,20 @@ def generate_contourImage_and_otherData(contours, image):
         "histogram_images": histogram_base64,
         "contour_count": len(contours),
         "stats": stats,
-        "parameters":parameters
+        "parameters":parameters,
+        "units":units
     }
     
-import cv2 as cv
-import numpy as np
-import matplotlib.pyplot as plt
-from skimage import morphology
-from io import BytesIO
-import base64
-from PIL import Image
+
+def skeletonize(image):
+    gray = cv.cvtColor(image , cv.COLOR_BGR2GRAY)
+    _, binary = cv.threshold(image,15, 255, cv.THRESH_BINARY )
+    binary_bool = binary > 0
+
+    # Perform skeletonization using skimage
+    skeleton = morphology.skeletonize(binary_bool)
+    return skeleton
+    
 
 def process_and_skeletonize_base64(image, blurred_image, threshold=15):
     """
@@ -167,6 +177,7 @@ def process_and_skeletonize_base64(image, blurred_image, threshold=15):
     binary_bool = binary > 0
     skeleton = morphology.skeletonize(binary_bool)
     inverted_skeleton = np.logical_not(skeleton).astype(np.uint8) * 255  # Convert to 0–255 for image
+    
 
     # Convert to PIL image
     pil_img = Image.fromarray(inverted_skeleton)
@@ -177,3 +188,124 @@ def process_and_skeletonize_base64(image, blurred_image, threshold=15):
     base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
     return base64_image
+
+from scipy.ndimage import convolve
+
+
+
+
+
+def generate_branching_dist(image):
+
+    gray = cv.cvtColor(image , cv.COLOR_BGR2GRAY)
+    # blurred_image = cv.GaussianBlur(gray, (5, 5), 10)
+    _, binary = cv.threshold(gray,15, 255, cv.THRESH_BINARY )
+    binary_bool = binary > 0
+    skeleton = morphology.skeletonize(binary_bool)
+
+    _, intersections = detect_endpoints_intersections(skeleton)
+    # Convert skeleton to an 8-bit image for contour detection
+    binary_8bit = (binary_bool * 255).astype(np.uint8)
+    skeleton_8bit = (skeleton * 255).astype(np.uint8)
+    cleaned_skeleton = skeleton_8bit.copy()
+    # Find contours
+    contours, _ = cv.findContours(binary_8bit, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    # Create a color image to draw contours and bounding rectangles
+    color_skeleton = cv.cvtColor(skeleton_8bit, cv.COLOR_GRAY2BGR)
+    
+    
+    class_masks = {
+        'Linear': np.zeros_like(gray, dtype=np.uint8),
+        'Less Branched': np.zeros_like(gray, dtype=np.uint8),
+        'More Branched': np.zeros_like(gray, dtype=np.uint8),
+        'Highly Branched (Mesh)': np.zeros_like(gray, dtype=np.uint8)
+    }
+    
+    for i, contour in enumerate(contours):
+        # Get the bounding box of the contour
+        x, y, w, h = cv.boundingRect(contour)
+        
+        # Count the number of intersections within the bounding box
+        num_intersections = np.sum(intersections[y:y+h, x:x+w] > 0)
+        
+        # Classify the contour
+        classification = classify_contour(num_intersections)
+        
+        # Draw the contour on the corresponding class mask
+        cv.drawContours(class_masks[classification], [contour], -1, 255, thickness=cv.FILLED)
+    
+    
+    results = {}
+
+    for class_name, class_mask in class_masks.items():
+        # Create a masked image
+        masked_image = cv.bitwise_and(image, image, mask=class_mask)
+
+        # Invert the masked image for better visibility
+        inverted_masked_image = cv.bitwise_not(masked_image)
+        
+          # Convert to base64-encoded PNG
+        pil_img = Image.fromarray(inverted_masked_image)
+        buffer = BytesIO()
+        pil_img.save(buffer, format="PNG")
+        encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        # Calculate statistics
+        num_contours_in_class = sum(
+            1 for contour in contours
+            if classify_contour(np.sum(intersections[
+                cv.boundingRect(contour)[1]:cv.boundingRect(contour)[1] + cv.boundingRect(contour)[3],
+                cv.boundingRect(contour)[0]:cv.boundingRect(contour)[0] + cv.boundingRect(contour)[2]
+            ] > 0)) == class_name
+        )
+
+        # Save results in dictionary
+        results[class_name] = {
+            "inverted_masked_image": encoded_image,
+            "num_contours": int(num_contours_in_class)
+        }
+        
+        
+    return results
+
+
+
+# Define classification thresholds
+def classify_contour(num_intersections):
+    if num_intersections == 0:
+        return 'Linear'
+    elif num_intersections <= 3:
+        return 'Less Branched'
+    elif num_intersections <= 10:
+        return 'More Branched'
+    else:
+        return 'Highly Branched (Mesh)'
+
+
+def detect_endpoints_intersections(skeleton):
+    # Ensure skeleton is binary and of type uint8
+    skeleton = (skeleton > 0).astype(np.uint8)
+
+    # Define a kernel to detect intersections
+    kernel = np.array([[1, 1, 1],
+                       [1, 1, 1],
+                       [1, 1, 1]])
+
+    # Convolve the kernel with the skeleton image
+    neighbor_count = cv.filter2D(skeleton, -1, kernel)
+
+    # Detect endpoints (pixels with exactly 2 neighbors)
+    endpoints = ((skeleton == 1) & (neighbor_count == 2)).astype(np.uint8)
+
+    # Detect intersections (pixels with more than 3 neighbors)
+    intersections = ((skeleton == 1) & (neighbor_count > 3)).astype(np.uint8)
+    # if len(intersections.shape) == 3:
+    #     intersections = cv.cvtColor(intersections, cv.COLOR_BGR2GRAY)
+
+    # _, intersections_bin = cv.threshold(intersections, 1, 255, cv.THRESH_BINARY)
+
+    # _, labeled_intersections = cv.connectedComponents(intersections_bin, connectivity=8)
+    # Ensure that each kernel match corresponds to one intersection point
+    _, labeled_intersections = cv.connectedComponents(intersections, connectivity=8)
+    return endpoints, labeled_intersections
+

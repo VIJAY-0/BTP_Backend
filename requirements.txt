@@ -2,7 +2,5 @@ opencv-python
 numpy
 matplotlib
 django
-gunicorn
-whitenoise
-psycopg2-binary
 scikit-image
+
