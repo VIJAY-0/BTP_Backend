@@ -2,5 +2,8 @@ opencv-python
 numpy
 matplotlib
 django
+whitenoise
 scikit-image
-
+django-cors-headers
+pillow       
+django-rest-framework
